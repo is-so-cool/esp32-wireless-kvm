@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🪐 Web Serial 工业级 VNC/PiKVM 键鼠托管台</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #141419; color: #e3e3e6; text-align: center; margin: 0; padding: 0; height: 100vh; display: flex; flex-direction: column; justify-content: space-between; overflow: hidden; }
+        .top-bar { background: #1e1e24; padding: 15px; box-shadow: 0 4px 15px rgba(0,0,0,0.3); display: flex; align-items: center; justify-content: center; gap: 20px; z-index: 10; }
+        h3 { margin: 0; color: #4caf50; font-size: 18px; }
+        .btn-connect { background: #4caf50; color: white; border: none; padding: 8px 20px; font-size: 14px; font-weight: bold; border-radius: 6px; cursor: pointer; transition: 0.2s; }
+        .btn-connect:hover { background: #45a049; }
+        .btn-connect:disabled { background: #555; color: #888; cursor: not-allowed; }
+        
+        /* 核心：满屏 VNC 控制捕获巨幕 */
+        .vnc-screen { flex: 1; width: 100%; background: #0c0c0f; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; cursor: cell; transition: 0.3s; }
+        .vnc-screen:active { background: #111116; }
+        .vnc-tips { font-size: 20px; font-weight: bold; color: #ff9800; text-shadow: 0 2px 4px rgba(0,0,0,0.5); pointer-events: none; text-align: center; line-height: 1.6; }
+        .vnc-screen.locked .vnc-tips { color: #4caf50; }
+        
+        .bottom-panel { background: #1a1a20; padding: 12px; text-align: left; display: flex; gap: 10px; flex-wrap: wrap; z-index: 10; border-top: 1px solid #2d2d35; }
+        .btn-macro { background: #2d3033; color: #fff; border: 1px solid #4f5357; padding: 6px 12px; font-size: 12px; border-radius: 5px; cursor: pointer; transition: 0.1s; }
+        .btn-macro:hover { background: #3d4145; }
+        .indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #ea4335; }
+        .connected .indicator { background: #4caf50; }
+    </style>
+</head>
+<body>
+
+<!-- 顶部状态工具栏 -->
+<div class="top-bar" id="mainContainer">
+    <h3>🪐 PiKVM 级全屏控制台</h3>
+    <div style="display: flex; align-items: center; gap: 8px;">
+        <span class="indicator"></span>
+        <span id="statusText" style="font-size:13px; color:#aaa;">发射端未连接</span>
+    </div>
+    <button class="btn-connect" id="connectBtn">🔌 连接发射端硬件</button>
+</div>
+
+<!-- 🎮 核心巨幕：点击此区域鼠标隐形，直接无感跨屏 -->
+<div class="vnc-screen" id="vncScreen">
+    <div class="vnc-tips" id="vncTips">
+        点击这片黑色巨幕区域<br>
+        <span style="font-size:14px; color:#888;">➔ 鼠标将隐形并锁定，进入纯原生无感键鼠控制模式</span><br>
+        <span style="font-size:12px; color:#555;">(随时按下键盘 Esc 键，鼠标即可秒回 Mac 本地)</span>
+    </div>
+</div>
+
+<!-- 底部特权按键宏面板 -->
+<div class="bottom-panel">
+    <button class="btn-macro" id="macroCad">🔥 Ctrl + Alt + Delete</button>
+    <button class="btn-macro" id="macroCse">⚡ Ctrl + Shift + Esc</button>
+    <button class="btn-macro" id="macroWinR">💻 模拟 Win + R (运行)</button>
+    <button class="btn-macro" id="macroF2">F2</button>
+    <button class="btn-macro" id="macroF12">F12</button>
+    <button class="btn-macro" id="macroDel">Delete</button>
+    <button class="btn-macro" id="macroEsc">Escape</button>
+    <span style="font-size:11px; color:#555; margin-left:auto; align-self:center;">（已自动对齐官方 11/14 字节变长分帧通信指令）</span>
+</div>
+<script>
+window.onload = function() {
+    let port = null;
+    let writer = null;
+    let isControlActive = false; // 核心状态：当前是否处于全屏托管状态
+
+    const connectBtn = document.getElementById('connectBtn');
+    const vncScreen = document.getElementById('vncScreen');
+    const vncTips = document.getElementById('vncTips');
+    const mainContainer = document.getElementById('mainContainer');
+    const statusText = document.getElementById('statusText');
+
+    const KEY_CODES = {
+        'arrowup': 0x52, 'arrowdown': 0x51, 'arrowleft': 0x50, 'arrowright': 0x4F,
+        'enter': 0x28, 'escape': 0x29, 'f2': 0x3B, 'delete': 0x4C,
+        'backspace': 0x2A, ' ': 0x2C, 'tab': 0x2B
+    };
+
+    let currentModifiers = 0x00;
+
+    function getAsciiKeycode(char) {
+        if (char >= 'a' && char <= 'z') return char.charCodeAt(0) - 97 + 4;
+        if (char >= '1' && char <= '9') return char.charCodeAt(0) - 49 + 0x1E;
+        if (char === '0') return 0x27;
+        return null;
+    }
+
+    // 🎹 键盘数据帧打包（14 字节标准帧）
+    function packCh9329Cmd(keyCode, modifiers) {
+        let cmd = new Uint8Array(14);
+        cmd[0] = 0x57; cmd[1] = 0xAB; cmd[2] = 0x00; cmd[3] = 0x02; cmd[4] = 0x08;
+        cmd[5] = modifiers; cmd[6] = 0x00; cmd[7] = keyCode;
+        let checksum = 0;
+        for (let i = 0; i < 13; i++) checksum += cmd[i];
+        cmd[13] = checksum & 0xFF;
+        return cmd;
+    }
+
+    // 鼠标相对位移指令打包（🚨 严格修正版：移除杂质单词，精准锁定 11 字节！）
+    function packCh9329Mouse(buttonState, dx, dy, wheel) {
+        let cmd = new Uint8Array(11); // 严格死锁官方 11 字节规范
+        cmd[0] = 0x57; cmd[1] = 0xAB; cmd[2] = 0x00; cmd[3] = 0x05; cmd[4] = 0x05;
+        cmd[5] = 0x01;        // 相对移动模式
+        cmd[6] = buttonState; // 按键状态（0x01左, 0x02右）
+        cmd[7] = dx & 0xFF;   // X 位移有符号截断
+        cmd[8] = dy & 0xFF;   // Y 位移有符号截断
+        cmd[9] = wheel & 0xFF;// 滚轮
+        
+        let checksum = 0;
+        for (let i = 0; i < 10; i++) checksum += cmd[i];
+        cmd[10] = checksum & 0xFF;
+        return cmd;
+    }
+
+    // 串口连接
+    connectBtn.addEventListener('click', async () => {
+        try {
+            port = await navigator.serial.requestPort();
+            await port.open({ baudRate: 115200 });
+            writer = port.writable.getWriter();
+            mainContainer.classList.add('connected');
+            statusText.innerText = "KVM 高速大幕已开启";
+            connectBtn.disabled = true;
+        } catch (err) {
+            alert("串口连接失败: " + err);
+        }
+    });
+
+    // 🔒 1. 触发浏览器 Pointer Lock 囚禁锁鼠机制
+    vncScreen.addEventListener('click', () => {
+        if (!writer) { alert("请先点击顶部按钮连接发射端硬件！"); return; }
+        vncScreen.requestPointerLock(); // 强行向 Mac 申请锁死并隐形鼠标
+    });
+
+    // 监听全局锁鼠状态变动
+    document.addEventListener('pointerlockchange', () => {
+        if (document.pointerLockElement === vncScreen) {
+            isControlActive = true;
+            vncScreen.classList.add('locked');
+            vncTips.innerHTML = "<span style='color:#4caf50;font-size:24px;'>🔴 PiKVM 托管模式已完全激活</span><br><span style='color:#aaa;font-size:14px;'>现在直接移动、点击鼠标，敲击键盘！所有的输入已和目标机同步。</span><br><span style='color:#666;font-size:12px;'>（随时按下 Esc 键即可解除锁鼠，安全回到 Mac 本地）</span>";
+        } else {
+            isControlActive = false;
+            vncScreen.classList.remove('locked');
+            vncTips.innerHTML = "点击这片黑色巨幕区域<br><span style='font-size:14px; color:#888;'>➔ 鼠标将隐形并锁定，进入纯原生无感键鼠控制模式</span><br><span style='font-size:12px; color:#555;'>(随时按下键盘 Esc 键，鼠标即可秒回 Mac 本地)</span>";
+            if (writer) writer.write(packCh9329Cmd(0x00, 0x00)); // 退出时强制清空按键
+        }
+    });
+
+    // ==================== 鼠标相对位移高频同步 ====================
+    let lastThrottledTime = 0;
+    let mouseButtons = 0x00; 
+
+    window.addEventListener('mousemove', async (e) => {
+        if (!isControlActive || !writer) return;
+
+        // Pointer Lock 锁定状态下，读取真实的物理相对位移
+        let dx = e.movementX;
+        let dy = e.movementY;
+
+        // 🚀 33ms 限流消噪：完美配合接收端 9600 运力，彻底免除塞车发飘延迟
+        const now = performance.now();
+        if (now - lastThrottledTime < 33.3) return;
+        
+        // 适当放大手腕挪动系数（乘以 1.6），操控更跟手
+        dx = Math.max(-127, Math.min(127, Math.round(dx * 1.6)));
+        dy = Math.max(-127, Math.min(127, Math.round(dy * 1.7)));
+
+        if (dx !== 0 || dy !== 0) {
+            lastThrottledTime = now;
+            await writer.write(packCh9329Mouse(mouseButtons, dx, dy, 0));
+        }
+    });
+
+    // 监控巨幕内的物理点击
+    vncScreen.addEventListener('mousedown', async (e) => {
+        if (!isControlActive || !writer) return;
+        e.preventDefault();
+        if (e.button === 0) mouseButtons |= 0x01; // 左键下
+        if (e.button === 2) mouseButtons |= 0x02; // 右键下
+        await writer.write(packCh9329Mouse(mouseButtons, 0, 0, 0));
+    });
+
+    vncScreen.addEventListener('mouseup', async (e) => {
+        if (!isControlActive || !writer) return;
+        e.preventDefault();
+        if (e.button === 0) mouseButtons &= ~0x01; // 左键松
+        if (e.button === 2) mouseButtons &= ~0x02; // 右键松
+        await writer.write(packCh9329Mouse(mouseButtons, 0, 0, 0));
+    });
+
+    // 禁用右键菜单
+    vncScreen.addEventListener('contextmenu', e => e.preventDefault());
+
+    // ==================== 全键盘拦截状态机 ====================
+    window.addEventListener('keydown', async (e) => {
+        if (!isControlActive || !writer) return;
+        e.preventDefault();
+        if (e.repeat) return; // 物理层硬件防连发
+
+        let key = e.key.toLowerCase();
+        if (key === 'control') currentModifiers |= 0x01;
+        if (key === 'shift')   currentModifiers |= 0x02;
+        if (key === 'alt')     currentModifiers |= 0x04;
+        if (key === 'meta')    currentModifiers |= 0x01; // ⌘ 智能转 Ctrl
+
+        let code = 0x00;
+        if (KEY_CODES[key]) code = KEY_CODES[key];
+        else if (key.length === 1) code = getAsciiKeycode(key);
+
+        await writer.write(packCh9329Cmd(code, currentModifiers));
+    });
+
+    window.addEventListener('keyup', async (e) => {
+        if (!isControlActive || !writer) return;
+        e.preventDefault();
+        let key = e.key.toLowerCase();
+        if (key === 'control') currentModifiers &= ~0x01;
+        if (key === 'shift')   currentModifiers &= ~0x02;
+        if (key === 'alt')     currentModifiers &= ~0x04;
+        if (key === 'meta')    currentModifiers &= ~0x01;
+
+        await writer.write(packCh9329Cmd(0x00, currentModifiers));
+    });
+
+    // 底部辅助宏按钮功能
+    async function sendMacro(keyCode, mod = 0x00) {
+        if (!writer) return;
+        await writer.write(packCh9329Cmd(keyCode, mod));
+        setTimeout(async () => { if(writer) await writer.write(packCh9329Cmd(0x00, 0x00)); }, 15);
+    }
+
+    document.getElementById('macroCad').onclick = () => sendMacro(0x4C, 0x01 | 0x04);
+    document.getElementById('macroCse').onclick = () => sendMacro(0x29, 0x01 | 0x02);
+    document.getElementById('macroWinR').onclick = () => sendMacro(0x15, 0x08);
+    document.getElementById('macroF2').onclick = () => sendMacro(0x3B);
+    document.getElementById('macroF12').onclick = () => sendMacro(0x45);
+    document.getElementById('macroDel').onclick = () => sendMacro(0x4C);
+    document.getElementById('macroEsc').onclick = () => sendMacro(0x29);
+};
+</script>
+</body>
+</html>
